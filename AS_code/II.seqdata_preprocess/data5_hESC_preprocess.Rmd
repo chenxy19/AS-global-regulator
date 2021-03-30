@@ -1,0 +1,441 @@
+---
+title: "Single-cell RNA-seq of naive/primed embryonic stem cells: data preprocessing"
+author: Tobias Messmer and Aaron Lun
+date: 13 November 2017
+output: 
+  BiocStyle::html_document:
+    toc: true
+    toc_float: true
+    depth: 3
+    number_sections: true
+    theme: united 
+    fig_caption: false
+---
+
+```{r, echo=FALSE, results="hide"}
+dir.create("figure-preprocess/", showWarning=FALSE)
+knitr::opts_chunk$set(error=FALSE, warning=FALSE, message=FALSE, fig.path="figure-preprocess/")
+```
+
+# Creating a `SingleCellExperiment` object
+
+## Reading in the counts 
+
+The first step is to read in the counts and merge the technical replicates.
+We start by merging the technical replicates within each batch (2383/2384).
+
+```{r, datain}
+library(edgeR)
+all.counts <- list()
+gene.names <- NULL
+gene.length <- NULL
+
+for (sample in c("2383", "2384", "2677", "2678", "2739", "2740")){
+    cur.file <- list.files("../data/all_counts", pattern=paste0("genic_counts_", sample), full=TRUE)
+    current_counts <- read.table(cur.file, sep="\t", header=TRUE, row.names=1)
+
+    # Checking gene names and length are the same as those in other files.
+    if (is.null(gene.names)){
+        gene.names <- rownames(current_counts)
+        gene.length <- current_counts$Length
+    } else {
+        stopifnot(identical(gene.names, rownames(current_counts))) 
+        stopifnot(identical(gene.length, current_counts$Length))
+    }
+    current_counts$Length <- NULL 
+  
+    # Take the technical replicates and merge them, if they exist.
+    cellname <- colnames(current_counts)
+    cellname <- sub("^lane[0-9]_", "", cellname)
+    cellname <- sub("_L00[0-9]_", "_", cellname)
+    cellname <- sub("_[12]$", "", cellname) 
+    colnames(current_counts) <- cellname
+    if (any(duplicated(colnames(current_counts)))) {
+        current_counts <- sumTechReps(current_counts)
+        gc()
+    }
+
+    # Adding to the list.
+    all.counts[[sample]] <- as.matrix(current_counts)
+}  
+sapply(all.counts, ncol)
+```
+
+We then merge technical replicates across batches (2677 + 2678, and 2739 + 2740).
+
+```{r mergetech}
+stopifnot(identical(colnames(all.counts[["2677"]]), colnames(all.counts[["2678"]])))
+all.counts[["2677"]] <- all.counts[["2677"]] + all.counts[["2678"]]
+all.counts[["2678"]] <- NULL
+stopifnot(identical(colnames(all.counts[["2739"]]), colnames(all.counts[["2740"]])))
+all.counts[["2739"]] <- all.counts[["2739"]] + all.counts[["2740"]]
+all.counts[["2740"]] <- NULL
+sapply(all.counts, ncol)
+```
+
+Finally, we `cbind`  everything together into one large matrix. 
+This automatically adds the batch labels in front of the cell names.
+
+```{r cbindmat}
+for (sample in names(all.counts)) {
+    current <- all.counts[[sample]] 
+    colnames(current) <- paste0(sample, ".", colnames(current))
+    all.counts[[sample]] <- current
+}
+combined.counts <- do.call(cbind, all.counts)
+dim(combined.counts)
+```
+
+```{r, echo=FALSE, results='hide'}
+rm(all.counts)
+gc()
+```
+
+## Adding feature-level annotation 
+
+Next, we add information such as gene symbols and chromosome locations.
+We download human Ensembl annotation from BioMart, using a caching approach to avoid an expensive download step after the first run.
+
+```{r}
+library(BiocFileCache)
+bmcache <- BiocFileCache("biomart", ask = FALSE)
+loc <- bfcquery(bmcache, "hg38.ensGene", exact=TRUE)$rpath
+if (length(loc)==0L) {
+    library(biomaRt)
+    ensembl <- useMart(biomart='ENSEMBL_MART_ENSEMBL', dataset="hsapiens_gene_ensembl", 
+        host="aug2017.archive.ensembl.org") # Ensembl version 90.
+    ensemblGenes <- getBM(attributes=c('ensembl_gene_id',  'chromosome_name', 'gene_biotype', 
+        'external_gene_name', 'entrezgene'), filters="ensembl_gene_id", 
+        values=gene.names, mart=ensembl) 
+    saveRDS(ensemblGenes, file=bfcnew(bmcache, "hg38.ensGene"))
+} else {
+    ensemblGenes <- readRDS(loc)
+}
+```
+
+We store annotation along with the length information in our `SingleCellExperiment` object.
+For some reason, _biomaRt_ has decided to pad the Entrez ID; we get rid of that as well.
+
+```{r featureData}
+features <- ensemblGenes[match(gene.names, ensemblGenes$ensembl_gene_id),]
+features$ensembl_gene_id <- gene.names
+features$entrezgene <- gsub(" ", "", as.character(features$entrezgene))
+row.names(features) <- gene.names
+features$Length <- gene.length
+head(features)
+```
+
+Mitochondrial genes and spike-in transcripts are defined.
+
+```{r defineControls}
+is.spike <- grepl("^ERCC", gene.names)
+summary(is.spike)
+is.mito <- !is.na(features[!is.spike,]$chromosome_name) & features[!is.spike,]$chromosome_name=="MT"
+summary(is.mito)
+#先除spike,再除mito
+```
+
+## Adding sample-level annotation
+
+We then add information about the phenotype of the cells, i.e., naive or primed. 
+Cells are also categorized by their respective batch number.
+
+```{r phenData}
+sample <- sub("^([0-9]+)\\..*", "\\1", colnames(combined.counts))
+phenotype <- character(ncol(combined.counts))
+phenotype[sample %in% c("2383", "2677", "2678")] <- "naive"
+phenotype[sample %in% c("2384", "2739", "2740")] <- "primed"
+table(phenotype)
+batch <- character(ncol(combined.counts))
+batch[sample %in% c("2383", "2384")] <- "1"
+batch[sample %in% c("2677", "2678", "2739", "2740")] <- "2"
+table(batch)
+```
+
+This is used to construct a phenotype table describing each sample.
+
+```{r}
+pheno <- data.frame(phenotype, batch, sample, row.names = colnames(combined.counts))
+head(pheno)
+```
+
+## Constructing the `SingleCellExperiment` object
+
+We create a `SingleCellExperiment` container to facilitate further processing of the data.
+We specify the spike-in set for use in downstream processing.
+
+```{r newSCESet}
+library(SingleCellExperiment)
+sce <- SingleCellExperiment(list(counts=as.matrix(combined.counts[!is.spike,])), 
+    rowData=features[!is.spike,], colData=pheno)
+# the new version of SingleCellExperiment separately store endogeneous genes and spike-ins (in alternative experiment)
+#isSpike(sce, "ERCC") <- is.spike  # this is for old version
+altExp(sce,"ERCC")<-SingleCellExperiment(list(counts=as.matrix(combined.counts[is.spike,])     ), rowData=features[is.spike,], colData=pheno)
+# Or, there is a simple function to separate data matrix into a smaller endogenous matrix and alternative experiment: splitAltExps(). is.spike和is.mito在这里的处理是等价的。
+
+sce <- splitAltExps(sce, ifelse(is.mito, "mito", "gene"))
+
+sce
+```
+
+We also add a directory to store any useful results.
+
+```{r}
+resdir <- "results-preprocess"
+dir.create(resdir, showWarning=FALSE)
+```
+
+```{r, echo=FALSE, results='hide'}
+#rm(combined.counts)
+gc()
+```
+
+To enable a user-friendly analysis, it is convenient to exchange the ENSEMBL IDs with the name of the genes. 
+For duplicated gene names, we merge them with the ENSEMBL IDs to avoid confusion.
+
+```{r nameForID}
+library(scater)
+new.row.names <- uniquifyFeatureNames(
+    rowData(sce)$ensembl_gene_id,
+    rowData(sce)$external_gene_name
+)
+rownames(sce) <- new.row.names
+head(rownames(sce), 20)
+```
+
+## Removing low-quality cells
+
+A number of QC metrics are calculated for each cell using the `calculateQCMetrics` function.
+Note that the spike-in transcripts are automatically used in the `feature_controls`.
+
+```{r QCMetrics}
+sce_qc <- perCellQCMetrics(sce) 
+colData(sce)<-cbind(colData(sce), sce_qc)
+colnames(colData(sce))
+```
+
+Assuming that most cells are high-quality, we remove cells with outlier values for technical metrics.
+We start with the library sizes and the number of expressed genes.
+Cells with small library sizes (below ~100,000) or few expressed genes (below ~5000) are considered to be of low quality.
+We do the same for the proportion of reads mapped to mitochondrial and spike-in transcripts.
+Cells with high values for either metric are likely to be poor-quality, as cytoplasmic/nuclear RNA has been lost.
+
+```{r histoSize, fig.width=10, fig.height=10}
+multiplot(cols=2,
+    plotColData(sce, x="sample", y="sum"),   # sum of counts, or library size
+    plotColData(sce, x="sample", y="detected"),  # number of detected features
+    plotColData(sce, x="sample", y="altexps_ERCC_percent"),
+    plotColData(sce, x="sample", y="altexps_mito_percent")
+)
+```
+
+To filter out low-quality cells, we identify those with outlier values for any of the above metrics.
+We do this for each batch separately due to differences in sequencing depth and spike-in proportion between batches.
+isOutlier: nmads:  the minimum number of MADs away from median; type: whether outliers should be looked for at both tails ("both").
+
+```{r, remOutliers1}
+
+libsize.drop <- isOutlier(sce$sum, nmads=3, type="lower", log=TRUE, batch=sce$sample) 
+feature.drop <- isOutlier(sce$detected, nmads=3, type="lower", log=TRUE, batch=sce$sample) 
+mito.drop <- isOutlier(sce$altexps_mito_percent, nmads=3, type="higher", batch=sce$sample)
+spike.drop <- isOutlier(sce$altexps_ERCC_percent, nmads=3, type="higher", batch=sce$sample)
+discard <- libsize.drop | feature.drop | spike.drop | mito.drop
+data.frame(ByLibSize=sum(libsize.drop), ByFeature=sum(feature.drop), ByMito=sum(mito.drop),
+           BySpike=sum(spike.drop), Remaining.in.batch=sum(!discard))
+```
+
+Before we remove the cells, we check that we don't throw away one particular cell type that is hidden in the discarded cells.
+To do so, we look at the differences in gene expression between the cells we keep and the cells we filter out.
+
+```{r}
+#suppressWarnings({
+#    lost <- calcAverage(counts(sce)[,discard])  #outdated
+#    kept <- calcAverage(counts(sce)[,!discard])
+#})
+lost<-apply(counts(sce)[,discard],1,mean)
+kept<-apply(counts(sce)[,!discard],1,mean)
+log.vals <- edgeR::cpm(cbind(lost, kept), log=TRUE, prior=1)
+logfc <- log.vals[,1] - log.vals[,2]
+head(sort(logfc, decreasing=TRUE), 20)
+
+# Avoid loss of points when either average is zero.
+lost <- pmax(lost, min(lost[lost > 0]))
+kept <- pmax(kept, min(kept[kept > 0]))
+
+plot(lost, kept, xlab="Average count (discarded)", 
+    ylab="Average count (retained)", log="xy", pch=16)
+
+# Do the same for ERCC and mito genes
+sce_ERCC <- altExp(sce,"ERCC")
+lost<-apply(counts(sce_ERCC)[,discard],1,mean)
+kept<-apply(counts(sce_ERCC)[,!discard],1,mean)
+log.vals <- edgeR::cpm(cbind(lost, kept), log=TRUE, prior=1)
+logfc <- log.vals[,1] - log.vals[,2]
+head(sort(logfc, decreasing=TRUE), 20)
+lost <- pmax(lost, min(lost[lost > 0]))
+kept <- pmax(kept, min(kept[kept > 0]))
+
+points(lost, kept, col="red", pch=16)
+
+sce_mito <- altExp(sce,"mito")
+lost<-apply(counts(sce_mito)[,discard],1,mean)
+kept<-apply(counts(sce_mito)[,!discard],1,mean)
+log.vals <- edgeR::cpm(cbind(lost, kept), log=TRUE, prior=1)
+logfc <- log.vals[,1] - log.vals[,2]
+head(sort(logfc, decreasing=TRUE), 20)
+lost <- pmax(lost, min(lost[lost > 0]))
+kept <- pmax(kept, min(kept[kept > 0]))
+points(lost, kept, col="dodgerblue", pch=16)
+```
+
+It doesn't look like this is the case, so we can remove these cells from our `sce` object prior to further analysis.
+
+```{r, remOutliers3}
+sce <- sce[, !discard]
+dim(sce) 
+```
+
+```{r, echo=FALSE, results='hide'}
+gc()
+```
+
+## Classification into cell cycle phase
+
+We also examine the distribution of cells into different cell cycle phases.
+
+```{r filterPhase}
+
+library(scran)
+hs.pairs <- readRDS(system.file("exdata", "human_cycle_markers.rds", package="scran"))
+set.seed(10000)
+assigned <- cyclone(sce, pairs=hs.pairs, gene.names=rowData(sce)$ensembl_gene_id)
+write.table(file=file.path(resdir, "phases.tsv"), assigned, row.names=FALSE, sep="\t", quote=TRUE)
+head(assigned$scores)
+```
+
+Visualizing the scores.
+
+```{r phaseplot, fig.width=10, fig.height=6}
+par(mfrow=c(1,2))
+plot(assigned$scores$G1, assigned$scores$G2M, xlab="G1 score", ylab="G2/M score", pch=16)
+plot(assigned$scores$G1, assigned$scores$S, xlab="G1 score", ylab="S score", pch=16)
+```
+
+Phase assignments are stored in the `sce` object prior to further analysis.
+
+```{r}
+sce$phase <- assigned$phases
+table(assigned$phases)
+```
+
+# Examining the genes
+
+We look at the average abundance of each gene.
+
+```{r aveGenes}
+#library(scaterlegacy)
+#ave.counts <- calcAverage(sce, use_size_factors=FALSE)
+ave.counts <- apply(counts(sce),1,mean)
+rowData(sce)$AveCount <- ave.counts
+hist(log10(ave.counts), breaks=100, main="", col="grey", xlab=expression(Log[10]~"average count"))
+```
+
+We look at the number of cells expressing each gene.
+
+```{r numGenes}
+ncells <- scater::nexprs(sce, byrow=TRUE)
+rowData(sce)$Ncells <- ncells
+plot(ave.counts, ncells, xlab="Average count", ylab="Number of cells", log="x", pch=16, cex=0.5)
+```
+
+The most highly expressed genes should be constitutively expressed genes like mitochondrial transcripts, ribosomal proteins, actin and other usual suspects.
+
+```{r highEx, fig.height=12, fig.width=6}
+fontsize <- theme(axis.text=element_text(size=12), axis.title=element_text(size=16))
+scater::plotHighestExprs(sce, n=50) + fontsize
+```
+
+We discard genes that are not expressed at all.
+Such genes provide no information for characterizing heterogeneity across the population.
+
+```{r keepAbu}
+keep <- ave.counts > 0
+sce <- sce[keep,]
+summary(keep)
+```
+
+# Normalization of various technical biases
+
+## Removing scaling biases
+
+Cells are clustered together and scaling biases are removed using the deconvolution method.
+This is done using only high-abundance genes to avoid problems with having too many zeroes in low-abundance genes.
+quickCluster assign cells to clusters of similar expression, and normalization is applied within each cluster, to deal with a heterogeneous cell population.
+ComputeSumFactor is a normalization method that divide gene count by the scaling factor computed for each cell, plus 1 and take log. The scaling factor is computed for each cell with regard to the cluster the cell lies in.
+
+```{r sumnorm}
+set.seed(10000)
+clusters <- quickCluster(sce, method="igraph", min.mean=1)
+sce <- computeSumFactors(sce, cluster=clusters, min.mean=1)
+summary(sizeFactors(sce))
+```
+
+This correlates well with library size normalization, which is typically expected from read count data.
+
+```{r sumnormplot}
+plot(sizeFactors(sce), sce$sum/1e6, log="xy", ylab="Library size (millions)", 
+    xlab="Size factor", col=ifelse(sce$phenotype=="naive", "black", "grey"))
+```
+
+Spike-in transcripts are normalized separately, because they aren't subject to the effects of total RNA content.
+Here, the correlation is worse, which is also expected.
+
+```{r spikenorm}
+sce_ERCC <- computeSumFactors(altExp(sce,"ERCC"), cluster=clusters, min.mean=1)
+  #computeSpikeFactors(sce, type="ERCC", general.use=FALSE) 
+plot(sizeFactors(sce), sizeFactors(sce_ERCC), log="xy", ylab="Spike-in size factor", 
+    xlab="Deconvolution size factor", col=ifelse(sce$phenotype=="naive", "black", "grey"))
+```
+
+Finally, the size factors are applied to compute normalized log-expression values. endogeneous genes and spike-ins use their respective scaling factor.
+
+(An alternative method of normalization is to normalize endogeneous expression level with ERCC reads. The main practical difference is that spike-in normalization preserves differences in total RNA content between cells, whereas computeSumFactors and other non-DE methods do not.
+
+ex:
+sce2 <- computeSpikeFactors(sce, "ERCC")
+summary(sizeFactors(sce2))
+
+)
+
+```{r}
+sce <- logNormCounts(sce,log = TRUE)
+```
+
+## Checking for systematic technical effects
+
+As the cells have been sequenced in different batches, a batch-related bias is expected.
+We can examine the proportion of variance attributable to various factors.
+Phenotype is the largest contributor (obviously) but the batch effect also needs to be considered.
+
+```{r varbias}
+scater::plotExplanatoryVariables(sce, variables=c("phenotype", "batch")) + fontsize
+```
+
+We can remove the batch effect by calling `removeBatchEffect` while considering the phenotype.
+
+```{r}
+library(limma)
+scater::norm_exprs(sce) <- removeBatchEffect(logcounts(sce),
+    design=model.matrix(~sce$phenotype), batch=sce$batch)
+assayNames(sce)    
+```
+
+# Wrapping up
+
+We save the object to file for use in downstream analyses.
+
+```{r}
+saveRDS(sce, file="results-preprocess/sce_all.rds")
+sessionInfo()
+```
+

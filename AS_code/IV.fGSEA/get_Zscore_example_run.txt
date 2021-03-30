@@ -1,0 +1,8 @@
+python background_ver3.py expr/MN_expr_psi.csv MN_Zscore.csv 500
+python background_ver3.py expr/NPC_expr_psi.csv NPC_Zscore.csv 500
+python background_ver3.py expr/iPSC_expr_psi.csv iPSC_Zscore.csv 500
+python background_ver3.py expr/hHSC_expr_psi.csv hHSC_Zscore.csv 500
+python background_ver3.py expr/mouseSC_expr_psi.csv mHSC_Zscore.csv 500
+python background_ver3.py expr/mouseSC2_expr_psi.csv mNSC_Zscore.csv 500
+python background_ver3.py expr/human3_expr_psi.csv hESC_Zscore.csv 500
+
